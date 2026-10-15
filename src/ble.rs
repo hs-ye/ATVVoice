@@ -74,15 +74,28 @@ impl BleDevice for BluerDevice<'_> {
     fn write_command(&self, data: &[u8]) -> BleFut<'_, ()> {
         let data = data.to_vec();
         Box::pin(async move {
-            // TX characteristic has the 'write' flag (not 'write-without-response'),
-            // so we must use ATT Write Request (WriteOp::Request) instead of the
-            // default WriteOp::Command (ATT Write Command). Remotes silently ignore
-            // Write Commands on characteristics that only support Write Request.
-            self.chars.tx.write_ext(&data, &bluer::gatt::remote::CharacteristicWriteRequest {
+            // ATVV's TX characteristic is declared inconsistently across remotes:
+            // some advertise 'write' (ATT Write Request), others only
+            // 'write-without-response' (ATT Write Command) — e.g. the Chromecast
+            // "G9N9N" remote. BlueZ rejects the wrong op with
+            // org.bluez.Error.NotPermitted, so try Write Request first (the
+            // historically-working op) and fall back to Write Command.
+            let request = bluer::gatt::remote::CharacteristicWriteRequest {
                 op_type: WriteOp::Request,
                 ..Default::default()
-            }).await?;
-            Ok(())
+            };
+            match self.chars.tx.write_ext(&data, &request).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind == bluer::ErrorKind::NotPermitted => {
+                    let command = bluer::gatt::remote::CharacteristicWriteRequest {
+                        op_type: WriteOp::Command,
+                        ..Default::default()
+                    };
+                    self.chars.tx.write_ext(&data, &command).await?;
+                    Ok(())
+                }
+                Err(err) => Err(err.into()),
+            }
         })
     }
 
