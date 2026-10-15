@@ -71,6 +71,10 @@ impl Protocol for ProtocolV10 {
         ProtocolVersion::V1_0
     }
 
+    fn interaction_model(&self) -> InteractionModel {
+        self.interaction_model
+    }
+
     fn mic_open_cmd(&self) -> Vec<u8> {
         vec![u8::from(TxOpcode::MicOpen), u8::from(AudioMode::Playback)]
     }

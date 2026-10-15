@@ -13,6 +13,13 @@ pub trait Protocol: Send {
     /// Protocol version this implementation speaks.
     fn version(&self) -> ProtocolVersion;
 
+    /// Interaction model negotiated from CAPS_RESP.
+    ///
+    /// v0.4 has no interaction model, so the default is `OnRequest`.
+    fn interaction_model(&self) -> InteractionModel {
+        InteractionModel::OnRequest
+    }
+
     /// Build MIC_OPEN command bytes.
     fn mic_open_cmd(&self) -> Vec<u8>;
 

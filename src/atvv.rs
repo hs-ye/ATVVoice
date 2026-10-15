@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
 use crate::consumer;
-use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, StreamId};
+use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, InteractionModel, StreamId};
 use crate::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,12 +215,27 @@ pub async fn run_session(
                     CtlEvent::StartSearch => {
                         tracing::info!("START_SEARCH (state={:?})", state);
 
+                        // HoldToTalk remotes re-send START_SEARCH right after
+                        // AUDIO_START on a *single* press. Treating that as a
+                        // second (toggle-off) press closed the mic ~30 ms after
+                        // it opened, so the stream never delivered audio. Only
+                        // toggle for non-HTT models; with HTT the remote ends
+                        // the stream itself (AUDIO_STOP / HttButtonRelease).
+                        let hold_to_talk =
+                            protocol.interaction_model() == InteractionModel::HoldToTalk;
+
                         if state == State::Streaming || state == State::Opening {
-                            // Toggle: second press stops streaming
-                            let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
-                            ble.write_command(&protocol.mic_close_cmd(sid)).await?;
-                            tracing::info!("Sent MIC_CLOSE (toggle off)");
-                            close_mic_reset!(state, last_seq, current_stream_id);
+                            if hold_to_talk {
+                                tracing::debug!(
+                                    "START_SEARCH while active (HoldToTalk): keeping mic open"
+                                );
+                            } else {
+                                // Toggle: second press stops streaming
+                                let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                                ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                                tracing::info!("Sent MIC_CLOSE (toggle off)");
+                                close_mic_reset!(state, last_seq, current_stream_id);
+                            }
                         } else {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN");
