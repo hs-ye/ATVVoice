@@ -34,8 +34,11 @@ struct Cli {
     #[arg(short, long)]
     adapter: Option<String>,
 
-    /// Audio gain in dB (default: 20)
-    #[arg(short, long, default_value = "20")]
+    /// Audio gain in dB (default: 14)
+    ///
+    /// 20 dB drove the remote's already-hot signal into hard clipping
+    /// (peak 32768, 342 clipped samples in a 1.7 s utterance).
+    #[arg(short, long, default_value = "14")]
     gain: f32,
 
     /// Close mic after N seconds without audio frames (device asleep). 0 = disabled.
