@@ -104,7 +104,7 @@ pub struct SessionConfig<'a> {
 /// Run the configured trigger command, if any.
 fn fire_trigger(cmd: Option<&str>) {
     let Some(cmd) = cmd else { return };
-    tracing::debug!("trigger: {cmd}");
+    tracing::info!("trigger: {cmd}");
     match std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
