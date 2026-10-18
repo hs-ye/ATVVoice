@@ -101,26 +101,43 @@ pub struct SessionConfig<'a> {
     pub trigger_cmd: Option<&'a str>,
 }
 
+/// Wait this long before telling the trigger command to stop, so audio still
+/// inside the PipeWire buffers reaches the consumer first.
+const TRIGGER_STOP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Bumped on every trigger so a pending stop can tell it has been superseded.
+static TRIGGER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Run the configured trigger command, if any.
-fn fire_trigger(cmd: Option<&str>) {
+fn fire_trigger(cmd: Option<&str>, delay: Option<std::time::Duration>) {
     let Some(cmd) = cmd else { return };
-    tracing::info!("trigger: {cmd}");
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        // Reap on a helper thread so repeated presses cannot pile up zombies.
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+    let cmd = cmd.to_owned();
+    let generation = TRIGGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // On a helper thread: a delayed stop must not block the session loop, and
+    // the child still needs reaping.
+    std::thread::spawn(move || {
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+            if TRIGGER_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                tracing::debug!("trigger superseded by a newer press, skipping: {cmd}");
+                return;
+            }
         }
-        Err(e) => tracing::warn!("trigger command failed to start: {e}"),
-    }
+        tracing::info!("trigger: {cmd}");
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(e) => tracing::warn!("trigger command failed to start: {e}"),
+        }
+    });
 }
 
 /// Run the ATVV protocol session.
@@ -162,7 +179,10 @@ pub async fn run_session(
         // and on every way out (release, frame timeout, transport error) so a
         // dictation tool is never left recording.
         if (previous == State::Streaming) != (s == State::Streaming) {
-            fire_trigger(trigger_cmd);
+            // Leaving streaming: wait for audio still in the buffers to reach
+            // the consumer before telling it to stop.
+            let delay = (s != State::Streaming).then_some(TRIGGER_STOP_DELAY);
+            fire_trigger(trigger_cmd, delay);
         }
         if let Some(tx) = state_tx {
             if tx.send(s).is_err() {

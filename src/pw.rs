@@ -178,13 +178,29 @@ fn write_pcm_to_sink(
     );
 
     let gain_linear = 10f32.powf(gain_db / 20.0);
-    let silence = vec![0u8; (sample_rate as usize / 1000) * TICK.as_millis() as usize * 2];
     let mut bytes: Vec<u8> = Vec::with_capacity(8192);
+    // 20 ms of silence, written only to fill a deficit against the clock.
+    let silence = vec![0u8; (sample_rate as usize / 1000) * TICK.as_millis() as usize * 2];
+
+    let started = std::time::Instant::now();
+    let mut written_samples: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        // Pace to the wall clock. Writing faster than real time — which the old
+        // unconditional silence ticks did whenever the frame queue happened to
+        // be empty — makes pw-cat queue audio, so the backlog grows through an
+        // utterance and the tail is still in flight when the consumer is told
+        // to stop. Never write ahead of the clock.
+        let due = (started.elapsed().as_secs_f64() * sample_rate as f64) as u64;
+        if written_samples > due {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
         match audio_rx.recv_timeout(TICK) {
             Ok(mut frame) => {
                 crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
@@ -196,11 +212,21 @@ fn write_pcm_to_sink(
                     tracing::warn!("pw-cat write failed: {e}");
                     break;
                 }
+                written_samples += (bytes.len() / 2) as u64;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(e) = stdin.write_all(&silence) {
-                    tracing::warn!("pw-cat write failed: {e}");
-                    break;
+                // Nothing pending: fill the gap up to the clock so the sink
+                // stays fed, but never beyond it.
+                let mut deficit = (due - written_samples) as usize;
+                let chunk = silence.len() / 2;
+                while deficit > 0 {
+                    let take = deficit.min(chunk);
+                    if let Err(e) = stdin.write_all(&silence[..take * 2]) {
+                        tracing::warn!("pw-cat write failed: {e}");
+                        break;
+                    }
+                    written_samples += take as u64;
+                    deficit -= take;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
