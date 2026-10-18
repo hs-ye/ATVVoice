@@ -94,6 +94,33 @@ pub struct SessionConfig<'a> {
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
     pub consumer_rx: Option<tokio::sync::mpsc::Receiver<consumer::ConsumerEvent>>,
     pub mic_on_demand: bool,
+    /// Shell command run when streaming starts and again when it stops.
+    ///
+    /// Lets an external dictation tool follow the remote's button, e.g.
+    /// `handy --toggle-transcription`.
+    pub trigger_cmd: Option<&'a str>,
+}
+
+/// Run the configured trigger command, if any.
+fn fire_trigger(cmd: Option<&str>) {
+    let Some(cmd) = cmd else { return };
+    tracing::debug!("trigger: {cmd}");
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // Reap on a helper thread so repeated presses cannot pile up zombies.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::warn!("trigger command failed to start: {e}"),
+    }
 }
 
 /// Run the ATVV protocol session.
@@ -121,6 +148,7 @@ pub async fn run_session(
         state_tx,
         mut consumer_rx,
         mic_on_demand,
+        trigger_cmd,
     } = config;
     let mut state = State::Connected;
 
@@ -128,7 +156,14 @@ pub async fn run_session(
     // `state` is used independently in the tokio::select! branches below. Capturing
     // it mutably would prevent its use in match guards and conditions.
     let set_state = |s: State, state: &mut State| {
+        let previous = *state;
         *state = s;
+        // Keep the external trigger paired with streaming: fire on the way in
+        // and on every way out (release, frame timeout, transport error) so a
+        // dictation tool is never left recording.
+        if (previous == State::Streaming) != (s == State::Streaming) {
+            fire_trigger(trigger_cmd);
+        }
         if let Some(tx) = state_tx {
             if tx.send(s).is_err() {
                 tracing::debug!("state_tx: no receivers");
@@ -606,6 +641,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     mic_on_demand: false,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -710,6 +746,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     mic_on_demand: false,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -795,6 +832,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     mic_on_demand: false,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -857,6 +895,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     mic_on_demand: false,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -956,6 +995,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: true,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1025,6 +1065,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: true,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1109,6 +1150,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: false, // disabled
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1182,6 +1224,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: true,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1267,6 +1310,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: true,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1347,6 +1391,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(consumer_rx),
                     mic_on_demand: true,
+                    trigger_cmd: None,
                 },
             )
             .await
@@ -1437,6 +1482,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     mic_on_demand: false,
+                    trigger_cmd: None,
                 },
             )
             .await

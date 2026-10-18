@@ -68,6 +68,12 @@ struct Cli {
     #[arg(long)]
     mic_on_demand: bool,
 
+    /// Shell command to run when the button starts streaming and again when it
+    /// stops, e.g. "handy --toggle-transcription". Lets a dictation tool follow
+    /// the remote's voice button without a keyboard shortcut.
+    #[arg(long)]
+    trigger_cmd: Option<String>,
+
     /// Increase log verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -468,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
                         state_tx: Some(&state_tx),
                         consumer_rx,
                         mic_on_demand: cli.mic_on_demand,
+                        trigger_cmd: cli.trigger_cmd.as_deref(),
                     },
                 ) => result,
                 _ = tokio::signal::ctrl_c() => {
