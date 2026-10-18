@@ -307,7 +307,10 @@ async fn main() -> anyhow::Result<()> {
             if ble_name.is_empty() {
                 "ATVVoice Microphone".to_string()
             } else {
-                ble_name.clone()
+                // Mark it as a microphone, and keep it free of spaces: module
+                // arguments are whitespace-split, so "Chromecast Remote
+                // microphone" would show up in sound settings as "Chromecast".
+                format!("{}-mic", ble_name.replace(' ', "-"))
             }
         });
 

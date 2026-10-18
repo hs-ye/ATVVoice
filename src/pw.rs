@@ -82,13 +82,26 @@ fn remove_stale(sink: &str, source: &str) {
     }
 }
 
+/// Make a value safe for a module argument.
+///
+/// pipewire-pulse splits module arguments on whitespace and drops surrounding
+/// quotes, so a value containing a space is truncated at the first one
+/// ("Chromecast Remote microphone" arrives as "Chromecast"). Hyphens are the
+/// only way to keep the whole value visible.
+fn escape_arg(value: &str) -> String {
+    value.replace(' ', "-")
+}
+
 /// Create the null sink backing the microphone; returns its module id.
 fn create_sink(sink: &str, description: &str) -> Option<u32> {
     let id = pactl(&[
         "load-module",
         "module-null-sink",
         &format!("sink_name={sink}"),
-        &format!("sink_properties=device.description=\"{description}\""),
+        &format!(
+            "sink_properties=device.description={}",
+            escape_arg(description)
+        ),
     ])?
     .parse::<u32>()
     .ok()?;
@@ -108,7 +121,10 @@ fn create_remap(source: &str, master: &str, description: &str) -> Option<u32> {
         "module-remap-source",
         &format!("master={master}"),
         &format!("source_name={source}"),
-        &format!("source_properties=device.description=\"{description}\""),
+        &format!(
+            "source_properties=device.description={}",
+            escape_arg(description)
+        ),
     ])?
     .parse::<u32>()
     .ok()
