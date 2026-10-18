@@ -184,19 +184,22 @@ fn write_pcm_to_sink(
 
     let started = std::time::Instant::now();
     let mut written_samples: u64 = 0;
+    // Allow a small, capped lead over the clock. It keeps pw-cat's buffer fed
+    // through brief gaps between BLE frames — so silence is never spliced into
+    // the middle of a word — while the cap stops the backlog growing the way
+    // the old unconditional silence ticks did.
+    let lead_samples = (sample_rate as u64 / 1000) * 150;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        // Pace to the wall clock. Writing faster than real time — which the old
-        // unconditional silence ticks did whenever the frame queue happened to
-        // be empty — makes pw-cat queue audio, so the backlog grows through an
-        // utterance and the tail is still in flight when the consumer is told
-        // to stop. Never write ahead of the clock.
+        // Pace to the wall clock. Writing further ahead than the lead makes
+        // pw-cat queue audio, so the lag grows through an utterance and the
+        // tail is still in flight when the consumer is told to stop.
         let due = (started.elapsed().as_secs_f64() * sample_rate as f64) as u64;
-        if written_samples > due {
+        if written_samples > due + lead_samples {
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
@@ -215,9 +218,9 @@ fn write_pcm_to_sink(
                 written_samples += (bytes.len() / 2) as u64;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Nothing pending: fill the gap up to the clock so the sink
-                // stays fed, but never beyond it.
-                let mut deficit = (due - written_samples) as usize;
+                // Nothing pending and we have fallen behind the clock: fill the
+                // gap with silence so the sink stays fed.
+                let mut deficit = due.saturating_sub(written_samples) as usize;
                 let chunk = silence.len() / 2;
                 while deficit > 0 {
                     let take = deficit.min(chunk);
