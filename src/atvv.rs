@@ -265,30 +265,43 @@ pub async fn run_session(
                 }
             }
             Some(data) = rx_stream.next() => {
-                if state == State::Streaming {
-                    if let Some(frame) = protocol.decode_audio(&data) {
-                        // Reset frame timer on every audio frame
-                        if frame_timeout_enabled {
-                            frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
-                        }
+                // A reconnect can leave the remote sending audio without
+                // re-sending AUDIO_START. Those frames used to be dropped
+                // silently — a whole press could vanish — so treat arriving
+                // audio as an implicit stream start.
+                if state != State::Streaming {
+                    tracing::warn!(
+                        "audio frame while not streaming (state={state:?}); treating as stream start"
+                    );
+                    set_state(State::Streaming, &mut state);
+                    last_seq = None;
+                    if frame_timeout_enabled {
+                        frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                    }
+                }
 
-                        // Sequence gap detection
-                        if let Some(last) = last_seq {
-                            let expected = last.wrapping_add(1);
-                            if frame.seq != expected {
-                                tracing::warn!(
-                                    "Sequence gap: expected {}, got {} (dropped {} frames)",
-                                    expected,
-                                    frame.seq,
-                                    frame.seq.wrapping_sub(expected)
-                                );
-                            }
-                        }
-                        last_seq = Some(frame.seq);
+                if let Some(frame) = protocol.decode_audio(&data) {
+                    // Reset frame timer on every audio frame
+                    if frame_timeout_enabled {
+                        frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                    }
 
-                        if audio_tx.send(frame).await.is_err() {
-                            tracing::warn!("audio frame dropped: receiver channel full or closed");
+                    // Sequence gap detection
+                    if let Some(last) = last_seq {
+                        let expected = last.wrapping_add(1);
+                        if frame.seq != expected {
+                            tracing::warn!(
+                                "Sequence gap: expected {}, got {} (dropped {} frames)",
+                                expected,
+                                frame.seq,
+                                frame.seq.wrapping_sub(expected)
+                            );
                         }
+                    }
+                    last_seq = Some(frame.seq);
+
+                    if audio_tx.send(frame).await.is_err() {
+                        tracing::warn!("audio frame dropped: receiver channel full or closed");
                     }
                 }
             }

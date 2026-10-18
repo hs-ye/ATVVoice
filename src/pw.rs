@@ -1,41 +1,204 @@
-//! PipeWire virtual audio source.
+//! PipeWire virtual microphone.
 //!
-//! Runs on a dedicated OS thread (not tokio-compatible). Receives decoded PCM
-//! frames via [`std::sync::mpsc`] and pushes them to PipeWire as a virtual
-//! microphone source.
+//! Decoded PCM is played into a private null sink with `pw-cat`, and the
+//! sink's monitor is republished by a remap source. That remapped source is
+//! what applications record from, under the same node name the old
+//! `Audio/Source` stream used.
 //!
-//! Uses `MainLoopRc` so the shutdown handler can clone the mainloop reference,
-//! and normal Rust drop order handles teardown after `mainloop.run()` returns.
+//! Why not a `media.class=Audio/Source` stream, which is what upstream does?
+//! On this system such a stream is never scheduled: the node reports
+//! `running`, the link is `active`, the format negotiates, and
+//! `Paused -> Streaming` fires — but its process callback is never invoked, so
+//! consumers only ever receive silence. A sink always has a driver, so playing
+//! into one is reliable. (An in-process playback stream was tried first and
+//! segfaulted inside libpipewire during setup, hence the `pw-cat` child.)
+//!
+//! This thread blocks. It also runs a PipeWire main loop purely to receive the
+//! shutdown signal, and writes PCM to the child from a worker thread.
 
-use std::io;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 
-use pipewire::context::ContextRc;
-use pipewire::keys;
 use pipewire::main_loop::MainLoopRc;
-use pipewire::properties::properties;
-use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
-use pipewire::spa::param::ParamType;
-use pipewire::spa::pod::serialize::PodSerializer;
-use pipewire::spa::pod::{Object, Pod, Value};
-use pipewire::spa::utils::{Direction, SpaTypes};
-use pipewire::stream::{Stream, StreamFlags, StreamRc};
-use pipewire::types::ObjectType;
 
-/// Number of audio channels (mono).
+/// Number of audio channels fed to the sink (mono).
 const CHANNELS: u32 = 1;
 
-/// Size of one sample in bytes (i16 = 2 bytes).
-const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
+/// How often the writer wakes when no audio is pending.
+const TICK: Duration = Duration::from_millis(20);
 
 /// Signal to shut down the PipeWire source cleanly.
 #[derive(Debug)]
 pub struct Shutdown;
 
-/// Run the PipeWire audio source on the current thread (blocking).
+/// Name of the private null sink that backs the virtual microphone.
+fn sink_name(node_name: &str) -> String {
+    format!("{node_name}-sink")
+}
+
+/// Run `pactl`, returning trimmed stdout on success.
+fn pactl(args: &[&str]) -> Option<String> {
+    match Command::new("pactl").args(args).output() {
+        Ok(out) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => {
+            tracing::warn!(
+                "pactl {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("could not run pactl {args:?}: {e}");
+            None
+        }
+    }
+}
+
+/// Drop a sink/remap source left behind by a previous run so the names stay
+/// predictable.
+fn remove_stale(sink: &str, source: &str) {
+    let Some(list) = pactl(&["list", "short", "modules"]) else {
+        return;
+    };
+    let sink_arg = format!("sink_name={sink}");
+    let source_arg = format!("source_name={source}");
+    for line in list.lines() {
+        let mut cols = line.split('\t');
+        let (Some(id), Some(module), Some(args)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let stale = (module == "module-null-sink" && args.contains(&sink_arg))
+            || (module == "module-remap-source" && args.contains(&source_arg));
+        if stale {
+            tracing::debug!("unloading stale {module} {id}");
+            pactl(&["unload-module", id]);
+        }
+    }
+}
+
+/// Create the null sink backing the microphone; returns its module id.
+fn create_sink(sink: &str, description: &str) -> Option<u32> {
+    let id = pactl(&[
+        "load-module",
+        "module-null-sink",
+        &format!("sink_name={sink}"),
+        &format!("sink_properties=device.description=\"{description}\""),
+    ])?
+    .parse::<u32>()
+    .ok()?;
+    // WirePlumber persists per-device volume/mute; a muted sink would make the
+    // microphone silent in a way that looks exactly like the bug we just fixed.
+    pactl(&["set-sink-volume", sink, "100%"]);
+    pactl(&["set-sink-mute", sink, "0"]);
+    tracing::info!("Virtual sink '{sink}' created");
+    Some(id)
+}
+
+/// Republish the sink monitor as an ordinary source, keeping the historical
+/// device name: some applications hide sources that look like monitors.
+fn create_remap(source: &str, master: &str, description: &str) -> Option<u32> {
+    pactl(&[
+        "load-module",
+        "module-remap-source",
+        &format!("master={master}"),
+        &format!("source_name={source}"),
+        &format!("source_properties=device.description=\"{description}\""),
+    ])?
+    .parse::<u32>()
+    .ok()
+}
+
+fn unload(module: u32) {
+    pactl(&["unload-module", &module.to_string()]);
+}
+
+/// Feed PCM to `pw-cat` so it plays into the null sink.
 ///
-/// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
-/// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
+/// Writes silence when idle rather than nothing: a continuously fed sink keeps
+/// the graph (and therefore the monitor) alive for consumers.
+fn write_pcm_to_sink(
+    audio_rx: mpsc::Receiver<Vec<i16>>,
+    gain_db: f32,
+    sample_rate: u32,
+    sink: &str,
+    stop: Arc<AtomicBool>,
+) {
+    let mut child = match Command::new("pw-cat")
+        .args([
+            "--playback",
+            "--target",
+            sink,
+            "--format",
+            "s16",
+            "--rate",
+            &sample_rate.to_string(),
+            "--channels",
+            &CHANNELS.to_string(),
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::error!("could not start pw-cat: {e}");
+            return;
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        tracing::error!("pw-cat stdin unavailable");
+        return;
+    };
+
+    tracing::info!(
+        "pw-cat playback into '{sink}' started ({}kHz S16LE mono, gain={gain_db}dB)",
+        sample_rate / 1000
+    );
+
+    let gain_linear = 10f32.powf(gain_db / 20.0);
+    let silence = vec![0u8; (sample_rate as usize / 1000) * TICK.as_millis() as usize * 2];
+    let mut bytes: Vec<u8> = Vec::with_capacity(8192);
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match audio_rx.recv_timeout(TICK) {
+            Ok(mut frame) => {
+                crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
+                bytes.clear();
+                for sample in frame {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                if let Err(e) = stdin.write_all(&bytes) {
+                    tracing::warn!("pw-cat write failed: {e}");
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(e) = stdin.write_all(&silence) {
+                    tracing::warn!("pw-cat write failed: {e}");
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    drop(stdin);
+    let _ = child.wait();
+    tracing::info!("pw-cat playback stopped");
+}
+
+/// Run the PipeWire microphone on the current thread (blocking).
+///
+/// Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
 /// Call from a dedicated `std::thread::spawn`.
 pub fn run_pw_source(
@@ -49,377 +212,54 @@ pub fn run_pw_source(
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
-    let mainloop = MainLoopRc::new(None)?;
+    if consumer_tx.is_some() {
+        tracing::warn!("--mic-on-demand is not supported by the sink backend; ignoring");
+    }
 
-    // Shared slot for the stream - set after creation, used by shutdown handler.
-    let stream_slot: std::rc::Rc<std::cell::RefCell<Option<StreamRc>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
+    // The microphone is the remapped monitor of this sink.
+    let sink = sink_name(node_name);
+    remove_stale(&sink, node_name);
+    let Some(sink_module) = create_sink(&sink, node_description) else {
+        tracing::error!("could not create virtual sink '{sink}' (is pactl available?)");
+        return Ok(());
+    };
+    let master = format!("{sink}.monitor");
+    let remap_module = create_remap(node_name, &master, node_description);
+    match remap_module {
+        Some(_) => tracing::info!("Microphone '{node_name}' is a remap of '{master}'"),
+        None => tracing::warn!("remap source unavailable; record from '{master}' instead"),
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        let sink = sink.clone();
+        std::thread::spawn(move || {
+            write_pcm_to_sink(audio_rx, gain_db, sample_rate, &sink, stop)
+        })
+    };
+
+    // The main loop exists only to deliver the shutdown signal.
+    let mainloop = MainLoopRc::new(None)?;
     let _receiver = shutdown_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
-        let stream_slot = stream_slot.clone();
+        let stop = stop.clone();
         move |_: Shutdown| {
             tracing::info!("PipeWire source shutting down");
-            // Disconnect stream while mainloop is alive (cpal pattern).
-            if let Some(stream) = stream_slot.borrow().as_ref() {
-                let _ = stream.disconnect();
-            }
+            stop.store(true, Ordering::Relaxed);
             mainloop.quit();
         }
     });
 
-    let context = ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
-    let core_clone = core.clone(); // Keep a clone for registry creation later
-
-    let stream = StreamRc::new(
-        core,
-        node_name,
-        properties! {
-            *keys::MEDIA_TYPE => "Audio",
-            *keys::MEDIA_CATEGORY => "Capture",
-            *keys::MEDIA_CLASS => "Audio/Source",
-            *keys::MEDIA_ROLE => "Communication",
-            *keys::NODE_NAME => node_name,
-            *keys::NODE_DESCRIPTION => node_description,
-        },
-    )?;
-
-    // Give the shutdown handler a reference to the stream.
-    *stream_slot.borrow_mut() = Some(stream.clone());
-
-    // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
-    let pending: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::new());
-
-    // Precompute linear gain multiplier outside the RT callback to avoid
-    // recomputing powf() on every frame.
-    let gain_linear = 10f32.powf(gain_db / 20.0);
-
-    /// Maximum pending samples before overflow truncation (~500ms at 16kHz).
-    const MAX_PENDING: usize = 8000;
-
-    // Track our PipeWire node ID once the stream reaches Paused/Streaming.
-    let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
-        std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
-
-    let _listener = stream
-        .add_local_listener_with_user_data(())
-        .state_changed({
-            let our_node_id = our_node_id.clone();
-            let stream_for_id = stream.clone();
-            move |_, _, old, new| {
-                tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
-                if matches!(
-                    new,
-                    pipewire::stream::StreamState::Paused
-                        | pipewire::stream::StreamState::Streaming
-                ) {
-                    let id = stream_for_id.node_id();
-                    if id != u32::MAX {
-                        our_node_id.set(id);
-                        tracing::debug!("PipeWire node ID: {id}");
-                    }
-                }
-            }
-        })
-        .process(move |stream: &Stream, _| {
-            // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
-            // At ~30 fps with 257 samples/frame, allocation pressure is negligible
-            // and not a real-time concern for voice audio rates.
-            let mut buf = pending.borrow_mut();
-
-            loop {
-                match audio_rx.try_recv() {
-                    Ok(mut frame) => {
-                        crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
-                        buf.extend_from_slice(&frame);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
-
-            // Bound pending buffer to prevent unbounded growth under backpressure.
-            if buf.len() > MAX_PENDING {
-                let dropped = buf.len() - MAX_PENDING;
-                buf.drain(..dropped);
-                tracing::warn!("audio buffer overflow: dropped {dropped} samples");
-            }
-
-            let Some(mut pw_buf) = stream.dequeue_buffer() else {
-                return;
-            };
-
-            let requested = pw_buf.requested() as usize;
-
-            let Some(pw_data) = pw_buf.datas_mut().first_mut() else {
-                return;
-            };
-
-            let Some(slice) = pw_data.data() else {
-                return;
-            };
-
-            let buf_capacity = slice.len() / SAMPLE_SIZE;
-            let max_samples = if requested > 0 {
-                buf_capacity.min(requested)
-            } else {
-                buf_capacity
-            };
-
-            let available = buf.len().min(max_samples);
-
-            // Copy i16 samples to the output buffer as little-endian bytes.
-            for (src, dst) in buf
-                .iter()
-                .take(available)
-                .zip(slice.chunks_exact_mut(SAMPLE_SIZE))
-            {
-                dst.copy_from_slice(&src.to_le_bytes());
-            }
-
-            // Zero remaining buffer bytes (silence).
-            let silence_start = available * SAMPLE_SIZE;
-            let silence_end = max_samples * SAMPLE_SIZE;
-            slice[silence_start..silence_end].fill(0);
-
-            if available > 0 {
-                buf.drain(..available);
-            }
-
-            let chunk = pw_data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = SAMPLE_SIZE as i32;
-            *chunk.size_mut() = (max_samples * SAMPLE_SIZE) as u32;
-        })
-        .register()?;
-
-    // Build the SPA audio format pod for format negotiation.
-    let mut audio_info = AudioInfoRaw::new();
-    audio_info.set_format(AudioFormat::S16LE);
-    audio_info.set_rate(sample_rate);
-    audio_info.set_channels(CHANNELS);
-
-    let mut position = [0u32; 64];
-    position[0] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_MONO;
-    audio_info.set_position(position);
-
-    let obj = Object {
-        type_: SpaTypes::ObjectParamFormat.as_raw(),
-        id: ParamType::EnumFormat.as_raw(),
-        properties: audio_info.into(),
-    };
-    let values: Vec<u8> =
-        PodSerializer::serialize(io::Cursor::new(Vec::new()), &Value::Object(obj))
-            .expect("failed to serialize audio format pod")
-            .0
-            .into_inner();
-
-    let mut params = [Pod::from_bytes(&values).expect("invalid pod bytes")];
-
-    stream.connect(
-        Direction::Output,
-        None,
-        StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-        &mut params,
-    )?;
-
-    tracing::info!(
-        "PipeWire source running ({}kHz S16LE mono, gain={gain_db}dB)",
-        sample_rate / 1000
-    );
-
-    // Registry link monitoring for --mic-on-demand.
-    //
-    // Tracks PipeWire Link objects that connect to our stream node. Excludes
-    // passive links (pavucontrol peak meters, level meters) so they don't
-    // trigger mic open or hold it open.
-    //
-    // Detection uses bound Link proxies: the registry global props don't include
-    // `link.passive`, but the Link proxy's `info` event does. When a link to our
-    // node appears, we bind its proxy and wait for the info callback to determine
-    // if it's passive. This handles the race where link globals arrive before
-    // their full properties are available.
-    //
-    // Detection: for each link to our node, we bind the OTHER node's proxy and
-    // check its full info properties for `node.want-driver == "true"`. The
-    // registry global only shows a subset of node properties; the bound Node
-    // proxy's `info` event includes everything — specifically `stream.monitor`
-    // which is set on peak detect streams (pavucontrol) but not real consumers.
-    #[allow(clippy::type_complexity)]
-    let (_registry, _registry_listener, _proxies) = if let Some(consumer_tx) = consumer_tx {
-        let registry = core_clone.get_registry_rc()?;
-
-        // Links to our node: link_id → other_node_id.
-        let our_links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, u32>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-        // Whether each Stream/Input/Audio node is a monitor (from bound Node info).
-        // true = monitor (don't count), false = real consumer.
-        // Nodes not yet in the map haven't received info yet — treated as "not
-        // monitor" so real consumers work before info arrives.
-        let node_is_monitor: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, bool>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-        // Last emitted consumer count (to avoid duplicate events).
-        let last_count: std::rc::Rc<std::cell::Cell<u32>> =
-            std::rc::Rc::new(std::cell::Cell::new(0));
-        // Bound proxies (must stay alive): link proxies + node proxies with listeners.
-        let proxies: std::rc::Rc<
-            std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
-        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-
-        // Count links where the other node is NOT a monitor. Emit Changed if count changed.
-        let recount = {
-            let our_links = our_links.clone();
-            let node_is_monitor = node_is_monitor.clone();
-            let last_count = last_count.clone();
-            let consumer_tx = consumer_tx.clone();
-            move || {
-                let links = our_links.borrow();
-                let monitors = node_is_monitor.borrow();
-                let count = links
-                    .values()
-                    .filter(|other_node| monitors.get(other_node) != Some(&true))
-                    .count() as u32;
-                if count != last_count.get() {
-                    last_count.set(count);
-                    tracing::debug!("PipeWire consumer count: {count}");
-                    if let Err(e) =
-                        consumer_tx.try_send(crate::consumer::ConsumerEvent::Changed(count))
-                    {
-                        tracing::warn!("Consumer event dropped: {e}");
-                    }
-                }
-            }
-        };
-
-        let listener = registry
-            .add_listener_local()
-            .global({
-                let our_node_id = our_node_id.clone();
-                let our_links = our_links.clone();
-                let node_is_monitor = node_is_monitor.clone();
-                let proxies = proxies.clone();
-                let registry = registry.clone();
-                let recount = recount.clone();
-                move |global| {
-                    match global.type_ {
-                        ObjectType::Node => {
-                            // Bind Stream/Input/Audio nodes to get their full info.
-                            let is_audio_input =
-                                global.props.as_ref().and_then(|p| p.get("media.class"))
-                                    == Some("Stream/Input/Audio");
-                            if !is_audio_input {
-                                return;
-                            }
-                            let node_id = global.id;
-                            let Ok(node) = registry.bind::<pipewire::node::Node, _>(global) else {
-                                return;
-                            };
-                            let node_listener = node
-                                .add_listener_local()
-                                .info({
-                                    let node_is_monitor = node_is_monitor.clone();
-                                    let recount = recount.clone();
-                                    move |info| {
-                                        let is_monitor =
-                                            info.props().and_then(|p| p.get("stream.monitor"))
-                                                == Some("true");
-                                        let mut map = node_is_monitor.borrow_mut();
-                                        let was_monitor =
-                                            map.get(&node_id).copied().unwrap_or(false);
-                                        if is_monitor && !was_monitor {
-                                            // Sticky: once classified as monitor, stays monitor.
-                                            // stream.monitor flickers during PW reconfiguration
-                                            // but a peak detect stream never becomes a real consumer.
-                                            tracing::debug!(
-                                                "PipeWire node (id={node_id}) classified as monitor"
-                                            );
-                                            map.insert(node_id, true);
-                                            drop(map);
-                                            recount();
-                                        } else if let std::collections::hash_map::Entry::Vacant(e) =
-                                            map.entry(node_id)
-                                        {
-                                            // First info: not a monitor stream.
-                                            e.insert(false);
-                                            drop(map);
-                                            recount();
-                                        }
-                                    }
-                                })
-                                .register();
-                            proxies
-                                .borrow_mut()
-                                .insert(node_id, Box::new((node, node_listener)));
-                        }
-                        ObjectType::Link => {
-                            let our_id = our_node_id.get();
-                            if our_id == u32::MAX {
-                                return;
-                            }
-                            let Some(props) = &global.props else {
-                                return;
-                            };
-                            let output_node = props
-                                .get("link.output.node")
-                                .and_then(|v| v.parse::<u32>().ok());
-                            let input_node = props
-                                .get("link.input.node")
-                                .and_then(|v| v.parse::<u32>().ok());
-                            if output_node != Some(our_id) && input_node != Some(our_id) {
-                                return;
-                            }
-                            let other_node = if output_node == Some(our_id) {
-                                input_node
-                            } else {
-                                output_node
-                            };
-                            let Some(other_id) = other_node else { return };
-
-                            let link_id = global.id;
-                            tracing::debug!(
-                                "PipeWire link to our node (id={link_id}, other_node={other_id})"
-                            );
-                            our_links.borrow_mut().insert(link_id, other_id);
-                            // Recount — if node info is already cached, this will
-                            // immediately include or exclude the link. If not yet
-                            // cached, the node's info callback will trigger recount.
-                            recount();
-                        }
-                        _ => {}
-                    }
-                }
-            })
-            .global_remove({
-                let our_links = our_links.clone();
-                let node_is_monitor = node_is_monitor.clone();
-                let proxies = proxies.clone();
-                let recount = recount.clone();
-                move |id| {
-                    proxies.borrow_mut().remove(&id);
-                    let had_link = our_links.borrow_mut().remove(&id).is_some();
-                    let had_node = node_is_monitor.borrow_mut().remove(&id).is_some();
-                    if had_link || had_node {
-                        recount();
-                    }
-                }
-            })
-            .register();
-
-        (Some(registry), Some(listener), Some(proxies))
-    } else {
-        (None, None, None)
-    };
-
-    // Block until quit.
     mainloop.run();
 
-    // Follow cpal's exact drop pattern: explicitly drop listener and context
-    // first, let stream, _receiver, and mainloop drop at function scope end.
-    // Do NOT call pipewire::deinit() - it's process-global and we may create
-    // another PW thread on reconnect.
-    drop(_listener);
-    drop(context);
+    let _ = writer.join();
+    if let Some(module) = remap_module {
+        unload(module);
+    }
+    unload(sink_module);
 
+    drop(_receiver);
     tracing::info!("PipeWire source stopped");
     Ok(())
 }

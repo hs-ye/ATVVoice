@@ -217,6 +217,73 @@ pub fn apply_gain(samples: &mut [i16], gain_db: f32) {
     apply_gain_linear(samples, gain);
 }
 
+/// One-pole DC blocker (high-pass at ~20 Hz).
+///
+/// Decoded frames from this remote carry a large positive bias (observed mean
+/// ≈ +780 pre-gain), which the gain stage then turns into hard clipping that
+/// swamps the speech. Removing the bias costs nothing audible.
+pub struct DcBlocker {
+    x1: f32,
+    y1: f32,
+    r: f32,
+}
+
+impl DcBlocker {
+    pub fn new(sample_rate: u32) -> Self {
+        // y[n] = x[n] - x[n-1] + R*y[n-1]
+        let r = 1.0 - (2.0 * core::f32::consts::PI * 20.0 / sample_rate as f32);
+        Self {
+            x1: 0.0,
+            y1: 0.0,
+            r,
+        }
+    }
+
+    /// Filter in place, carrying state across calls so frame boundaries are
+    /// seamless.
+    pub fn process(&mut self, samples: &mut [i16]) {
+        for s in samples.iter_mut() {
+            let x = *s as f32;
+            let y = x - self.x1 + self.r * self.y1;
+            self.x1 = x;
+            self.y1 = y;
+            *s = y.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+}
+
+#[cfg(test)]
+mod dc_block_tests {
+    use super::*;
+
+    #[test]
+    fn removes_constant_offset() {
+        let mut dc = DcBlocker::new(16000);
+        let mut samples = vec![800i16; 1600];
+        for _ in 0..20 {
+            dc.process(&mut samples);
+        }
+        assert!(
+            samples[1599].abs() < 50,
+            "offset not removed, got {}",
+            samples[1599]
+        );
+    }
+
+    #[test]
+    fn passes_speech_band_signal() {
+        let mut dc = DcBlocker::new(16000);
+        let mut samples: Vec<i16> = (0..1600)
+            .map(|i| {
+                (3000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin()) as i16
+            })
+            .collect();
+        dc.process(&mut samples);
+        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak > 2500, "AC signal attenuated, peak {peak}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

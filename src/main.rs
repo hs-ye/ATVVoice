@@ -431,13 +431,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            // Post-processing task: Protocol already decoded the audio,
-            // so we just apply declip/lowpass/gain and forward PCM.
+            // Post-processing task: Protocol already decoded the audio, so we
+            // apply declip/lowpass/DC-block and forward PCM. Gain is applied on
+            // the PipeWire thread.
             let decoder_handle = tokio::spawn(async move {
+                let mut dc_block = adpcm::DcBlocker::new(sample_rate);
                 while let Some(frame) = frame_rx.recv().await {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
+                    dc_block.process(&mut samples);
                     let _ = pcm_tx.send(samples);
                 }
             });
