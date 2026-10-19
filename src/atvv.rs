@@ -96,8 +96,8 @@ pub struct SessionConfig<'a> {
     pub mic_on_demand: bool,
     /// Shell command run when streaming starts and again when it stops.
     ///
-    /// Lets an external dictation tool follow the remote's button, e.g.
-    /// `handy --toggle-transcription`.
+    /// The direction is passed in the `ATVVOICE_TRIGGER` environment variable
+    /// (`start` or `stop`), so a wrapper can be idempotent rather than toggle.
     pub trigger_cmd: Option<&'a str>,
 }
 
@@ -105,11 +105,23 @@ pub struct SessionConfig<'a> {
 /// inside the PipeWire buffers reaches the consumer first.
 const TRIGGER_STOP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Ignore audio frames this soon after a stream ends: they are the tail of the
+/// same utterance, not a new press. A late frame used to re-enter `Streaming`
+/// and fire a second start trigger, leaving the dictation tool recording.
+const IMPLICIT_START_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Consecutive frames required before audio arriving outside a session is
+/// treated as an implicit stream start.
+const IMPLICIT_START_FRAMES: u8 = 3;
+
 /// Bumped on every trigger so a pending stop can tell it has been superseded.
 static TRIGGER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Run the configured trigger command, if any.
-fn fire_trigger(cmd: Option<&str>, delay: Option<std::time::Duration>) {
+///
+/// `action` is passed to the command as `ATVVOICE_TRIGGER` (`start` or `stop`)
+/// so a stateful wrapper can make the call idempotent instead of toggling.
+fn fire_trigger(cmd: Option<&str>, action: &'static str, delay: Option<std::time::Duration>) {
     let Some(cmd) = cmd else { return };
     let cmd = cmd.to_owned();
     let generation = TRIGGER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -123,10 +135,11 @@ fn fire_trigger(cmd: Option<&str>, delay: Option<std::time::Duration>) {
                 return;
             }
         }
-        tracing::info!("trigger: {cmd}");
+        tracing::info!("trigger({action}): {cmd}");
         match std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
+            .env("ATVVOICE_TRIGGER", action)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -168,21 +181,32 @@ pub async fn run_session(
         trigger_cmd,
     } = config;
     let mut state = State::Connected;
+    // When the last stream ended, and how many consecutive frames have arrived
+    // while not streaming (used to ignore the tail of the previous utterance).
+    let mut last_stream_end: Option<std::time::Instant> = None;
+    let mut stray_frames: u8 = 0;
 
     // set_state takes &mut State as a parameter rather than capturing it because
     // `state` is used independently in the tokio::select! branches below. Capturing
     // it mutably would prevent its use in match guards and conditions.
-    let set_state = |s: State, state: &mut State| {
+    let set_state = |s: State,
+                     state: &mut State,
+                     last_stream_end: &mut Option<std::time::Instant>,
+                     stray_frames: &mut u8| {
         let previous = *state;
         *state = s;
         // Keep the external trigger paired with streaming: fire on the way in
         // and on every way out (release, frame timeout, transport error) so a
         // dictation tool is never left recording.
-        if (previous == State::Streaming) != (s == State::Streaming) {
+        if previous == State::Streaming && s != State::Streaming {
+            *last_stream_end = Some(std::time::Instant::now());
+            *stray_frames = 0;
             // Leaving streaming: wait for audio still in the buffers to reach
             // the consumer before telling it to stop.
-            let delay = (s != State::Streaming).then_some(TRIGGER_STOP_DELAY);
-            fire_trigger(trigger_cmd, delay);
+            fire_trigger(trigger_cmd, "stop", Some(TRIGGER_STOP_DELAY));
+        } else if previous != State::Streaming && s == State::Streaming {
+            *stray_frames = 0;
+            fire_trigger(trigger_cmd, "start", None);
         }
         if let Some(tx) = state_tx {
             if tx.send(s).is_err() {
@@ -196,7 +220,12 @@ pub async fn run_session(
     // Inlines `set_state` logic to avoid borrow conflicts.
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
-            set_state(State::Connected, &mut $state);
+            set_state(
+                State::Connected,
+                &mut $state,
+                &mut last_stream_end,
+                &mut stray_frames,
+            );
             $last_seq = None;
             $current_stream_id = None;
         };
@@ -214,8 +243,6 @@ pub async fn run_session(
 
     // Track the current stream ID (set on AudioStart, used for MIC_CLOSE/keepalive).
     let mut current_stream_id: Option<StreamId> = None;
-
-
 
     // Keepalive: reset the remote's audio transfer timeout (spec §4.6.1)
     // using protocol.keepalive_cmd() (MIC_EXTEND for v1.0, MIC_OPEN for v0.4).
@@ -254,7 +281,7 @@ pub async fn run_session(
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
                         current_stream_id = Some(stream_id);
-                        set_state(State::Streaming, &mut state);
+                        set_state(State::Streaming, &mut state, &mut last_stream_end, &mut stray_frames);
                         // Reset keepalive timer when streaming starts/restarts
                         if keepalive_enabled {
                             keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
@@ -294,7 +321,7 @@ pub async fn run_session(
                         } else {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN");
-                            set_state(State::Opening, &mut state);
+                            set_state(State::Opening, &mut state, &mut last_stream_end, &mut stray_frames);
                             if frame_timeout_enabled {
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
@@ -310,7 +337,12 @@ pub async fn run_session(
                     CtlEvent::MicOpenError(code) => {
                         tracing::warn!("MIC_OPEN_ERROR: {:?}", code);
                         if state == State::Opening {
-                            set_state(State::Connected, &mut state);
+                            set_state(
+                                State::Connected,
+                                &mut state,
+                                &mut last_stream_end,
+                                &mut stray_frames,
+                            );
                             current_stream_id = None;
                         }
                     }
@@ -325,14 +357,36 @@ pub async fn run_session(
                 // silently — a whole press could vanish — so treat arriving
                 // audio as an implicit stream start.
                 if state != State::Streaming {
-                    tracing::warn!(
-                        "audio frame while not streaming (state={state:?}); treating as stream start"
-                    );
-                    set_state(State::Streaming, &mut state);
-                    last_seq = None;
-                    if frame_timeout_enabled {
-                        frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                    // A late frame can arrive right after AUDIO_STOP (the tail
+                    // of the same utterance). Treating a single frame as a new
+                    // press fired a second start trigger and left the dictation
+                    // tool recording, which inverted every later press/release.
+                    // Ignore frames briefly after a stream ends, and require a
+                    // few consecutive frames before an implicit start.
+                    let in_grace = last_stream_end
+                        .is_some_and(|t| t.elapsed() < IMPLICIT_START_GRACE);
+                    if in_grace || stray_frames < IMPLICIT_START_FRAMES {
+                        stray_frames = stray_frames.saturating_add(1);
+                        tracing::debug!(
+                            "audio frame while not streaming (state={state:?}); deferring implicit start"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "audio frame while not streaming (state={state:?}); treating as stream start"
+                        );
+                        set_state(
+                            State::Streaming,
+                            &mut state,
+                            &mut last_stream_end,
+                            &mut stray_frames,
+                        );
+                        last_seq = None;
+                        if frame_timeout_enabled {
+                            frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                        }
                     }
+                } else {
+                    stray_frames = 0;
                 }
 
                 if let Some(frame) = protocol.decode_audio(&data) {
@@ -374,7 +428,7 @@ pub async fn run_session(
                         if state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (external)");
-                            set_state(State::Opening, &mut state);
+                            set_state(State::Opening, &mut state, &mut last_stream_end, &mut stray_frames);
                             if frame_timeout_enabled {
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
@@ -395,7 +449,7 @@ pub async fn run_session(
                         } else if state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (external toggle)");
-                            set_state(State::Opening, &mut state);
+                            set_state(State::Opening, &mut state, &mut last_stream_end, &mut stray_frames);
                             if frame_timeout_enabled {
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
@@ -415,7 +469,7 @@ pub async fn run_session(
                         if count > 0 && state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (consumer connected, on-demand)");
-                            set_state(State::Opening, &mut state);
+                            set_state(State::Opening, &mut state, &mut last_stream_end, &mut stray_frames);
                             if frame_timeout_enabled {
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
@@ -447,12 +501,20 @@ pub async fn run_session(
                 match event {
                     DeviceConnectionEvent::Disconnected => {
                         tracing::info!("Device disconnected");
+                        if state == State::Streaming || state == State::Opening {
+                            // The session ended without AUDIO_STOP; don't leave
+                            // the dictation tool recording.
+                            fire_trigger(trigger_cmd, "stop", None);
+                        }
                         break;
                     }
                 }
             }
             else => {
                 tracing::info!("Notification streams ended");
+                if state == State::Streaming || state == State::Opening {
+                    fire_trigger(trigger_cmd, "stop", None);
+                }
                 break;
             }
         }
@@ -557,10 +619,7 @@ mod tests {
                     .await
                     .take()
                     .expect("connection_events called more than once");
-                Ok(
-                    Box::pin(UnboundedReceiverStream::new(rx))
-                        as BleStream<DeviceConnectionEvent>,
-                )
+                Ok(Box::pin(UnboundedReceiverStream::new(rx)) as BleStream<DeviceConnectionEvent>)
             })
         }
     }
@@ -576,7 +635,9 @@ mod tests {
     }
 
     /// Helper: receive all currently buffered commands from the mock controls.
-    async fn try_recv_all_commands(rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
+    async fn try_recv_all_commands(
+        rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
         let mut cmds = Vec::new();
         while let Ok(cmd) = rx.try_recv() {
             cmds.push(cmd);
@@ -969,8 +1030,6 @@ mod tests {
         let result = session.await.unwrap();
         assert!(result.is_ok());
     }
-
-
 
     // ── Test: Consumer connect triggers MIC_OPEN when Connected ────
 
@@ -1525,9 +1584,7 @@ mod tests {
         assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
 
         // AUDIO_STOP with reason=HttButtonRelease (0x02) → should NOT send MIC_CLOSE
-        ctrl.ctl_tx
-            .send(vec![CTL_AUDIO_STOP, 0x02])
-            .unwrap();
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP, 0x02]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 

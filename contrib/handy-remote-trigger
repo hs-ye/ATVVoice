@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Idempotent start/stop bridge between atvvoice and Handy.
+#
+# atvvoice sets ATVVOICE_TRIGGER=start|stop on every streaming transition.
+# Handy only exposes a toggle, so read Handy's real state from its log (the
+# last TranscribeAction::start/stop line) and only toggle when it differs.
+# That makes "press" always mean recording, regardless of any prior drift.
+set -euo pipefail
+
+action="${ATVVOICE_TRIGGER:-${1:-}}"
+case "$action" in
+    start | stop) ;;
+    *)
+        echo "usage: $0 start|stop (or set ATVVOICE_TRIGGER)" >&2
+        exit 2
+        ;;
+esac
+
+pgrep -x handy >/dev/null 2>&1 || exit 0
+
+log="${HANDY_LOG:-$HOME/.local/share/com.pais.handy/logs/handy.log}"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/handy-remote"
+mkdir -p "$state_dir"
+
+# Serialise start/stop so a fast press/release cannot race on the log.
+exec 9>"$state_dir/lock"
+flock 9
+
+last_action() {
+    local line act ts epoch now
+    line=$(tail -n 2000 "$log" 2>/dev/null |
+        grep -E 'TranscribeAction::(start|stop) called' |
+        tail -1) || return 0
+    [ -n "$line" ] || return 0
+    act=$(printf '%s\n' "$line" | sed -nE 's/.*TranscribeAction::(start|stop) called.*/\1/p')
+    ts=$(printf '%s\n' "$line" | sed -nE 's/^\[([0-9-]+)\]\[([0-9:]+)\].*/\1 \2/p')
+    if [ "$act" = start ] && [ -n "$ts" ]; then
+        epoch=$(date -u -d "$ts" +%s 2>/dev/null || echo 0)
+        now=$(date -u +%s)
+        # A "start" older than five minutes is stale, not a live press.
+        if [ "$epoch" -gt 0 ] && [ $((now - epoch)) -gt 300 ]; then
+            act=stop
+        fi
+    fi
+    printf '%s' "$act"
+}
+
+current=$(last_action)
+if [ -z "$current" ]; then
+    current=$(cat "$state_dir/state" 2>/dev/null || true)
+fi
+
+# Already in the requested state: nothing to do. This is the fix for the
+# inverted press/release behaviour.
+if [ "$current" = "$action" ]; then
+    exit 0
+fi
+
+handy --toggle-transcription >/dev/null 2>&1 || {
+    echo "handy-remote-trigger: handy --toggle-transcription failed" >&2
+    exit 1
+}
+printf '%s' "$action" >"$state_dir/state"
+
+# Handy writes its log asynchronously; confirm the toggle landed.
+for _ in $(seq 1 10); do
+    sleep 0.02
+    if [ "$(last_action)" = "$action" ]; then
+        exit 0
+    fi
+done
+
+echo "handy-remote-trigger: wanted $action, log last=$(last_action)" >&2
+exit 0
