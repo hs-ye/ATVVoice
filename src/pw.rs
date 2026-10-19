@@ -279,9 +279,7 @@ pub fn run_pw_source(
     let writer = {
         let stop = stop.clone();
         let sink = sink.clone();
-        std::thread::spawn(move || {
-            write_pcm_to_sink(audio_rx, gain_db, sample_rate, &sink, stop)
-        })
+        std::thread::spawn(move || write_pcm_to_sink(audio_rx, gain_db, sample_rate, &sink, stop))
     };
 
     // The main loop exists only to deliver the shutdown signal.
