@@ -107,10 +107,12 @@ fn sanitize_name(s: &str) -> String {
 fn instance_suffix(ble_name: &str, address: &str) -> String {
     let from_name = sanitize_name(ble_name);
     if from_name.is_empty() {
-        format!("dev-{}", sanitize_name(address))
-    } else {
-        from_name
+        return format!("dev-{}", sanitize_name(address));
     }
+    if from_name.starts_with(|c: char| c.is_ascii_digit()) {
+        return format!("dev-{from_name}");
+    }
+    from_name
 }
 
 /// Wait for device to be connected, using event stream if possible.
@@ -225,6 +227,11 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!(
                 "--name {name:?} contains invalid characters. \
                  Use lowercase alphanumeric, hyphens, and underscores only (e.g. --name {sanitized:?})."
+            );
+        }
+        if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+            anyhow::bail!(
+                "--name {name:?} would produce an invalid D-Bus name because it begins with a digit (e.g. --name dev-{sanitized})."
             );
         }
     }
@@ -632,6 +639,14 @@ mod tests {
         assert_eq!(
             instance_suffix("", "47:54:51:48:DA:A1"),
             "dev-47-54-51-48-da-a1"
+        );
+    }
+
+    #[test]
+    fn instance_suffix_prefixes_a_name_that_starts_with_a_digit() {
+        assert_eq!(
+            instance_suffix("2nd Remote", "C0:5D:39:C3:45:D1"),
+            "dev-2nd-remote"
         );
     }
 }
