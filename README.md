@@ -27,6 +27,9 @@ This fork adds the sink-backed microphone, a hold-to-talk trigger for
 [Handy](https://handy.computer) and the udev button remap, so a Chromecast Voice Remote works
 as a dictation mic without touching the keyboard.
 
+Full guide: **[docs/chromecast-voice-remote.md](docs/chromecast-voice-remote.md)** — pairing,
+Handy, routing the virtual mic, the button map, troubleshooting, and the Wayland notes.
+
 ```bash
 git clone https://github.com/hs-ye/ATVVoice ~/GitRepos/ATVVoice
 cd ~/GitRepos/ATVVoice
