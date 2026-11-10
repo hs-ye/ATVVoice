@@ -1,0 +1,7 @@
+{
+  "always_on_microphone": true,
+  "vad_enabled": true,
+  "vad_backend": "silero",
+  "selected_microphone": "pipewire",
+  "paste_method": "direct"
+}

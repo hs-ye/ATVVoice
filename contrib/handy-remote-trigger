@@ -2,9 +2,12 @@
 # Idempotent start/stop bridge between atvvoice and Handy.
 #
 # atvvoice sets ATVVOICE_TRIGGER=start|stop on every streaming transition.
-# Handy only exposes a toggle, so read Handy's real state from its log (the
-# last TranscribeAction::start/stop line) and only toggle when it differs.
-# That makes "press" always mean recording, regardless of any prior drift.
+# Handy only exposes a toggle, so read its real state from its log (the last
+# TranscribeAction::start/stop line) and only act when it differs.
+#
+# A press always means "listen": if Handy is already recording something we did
+# not start (its keyboard shortcut, or a toggle that drifted), the recording is
+# restarted rather than ignored.
 set -euo pipefail
 
 action="${ATVVOICE_TRIGGER:-${1:-}}"
@@ -16,11 +19,32 @@ case "$action" in
         ;;
 esac
 
-pgrep -x handy >/dev/null 2>&1 || exit 0
-
 log="${HANDY_LOG:-$HOME/.local/share/com.pais.handy/logs/handy.log}"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/handy-remote"
 mkdir -p "$state_dir"
+decision_log="$state_dir/trigger.log"
+
+note() {
+    printf '%s %s\n' "$(date -Is)" "$*" >>"$decision_log"
+}
+
+# Handy's CLI is a GUI binary: with no X display it exits 1 and the toggle
+# never reaches the running app. A user service started at boot has no
+# DISPLAY (it is imported later by the desktop session), so recover it.
+if [ -z "${DISPLAY:-}" ]; then
+    DISPLAY=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DISPLAY=//p')
+    if [ -z "$DISPLAY" ]; then
+        DISPLAY=$(ls /tmp/.X11-unix 2>/dev/null | sed -n 's/^X//p' | sort -n | tail -1)
+        [ -n "$DISPLAY" ] && DISPLAY=":$DISPLAY"
+    fi
+    export DISPLAY
+    note "display=${DISPLAY:-none} (recovered)"
+fi
+
+if ! pgrep -x handy >/dev/null 2>&1; then
+    note "action=$action handy=not-running"
+    exit 0
+fi
 
 # Serialise start/stop so a fast press/release cannot race on the log.
 exec 9>"$state_dir/lock"
@@ -45,30 +69,51 @@ last_action() {
     printf '%s' "$act"
 }
 
+toggle() {
+    if handy --toggle-transcription >/dev/null 2>&1; then
+        printf '%s' "$1" >"$state_dir/state"
+        date +%s >"$state_dir/since"
+        return 0
+    fi
+    note "toggle($1) failed"
+    return 1
+}
+
 current=$(last_action)
 if [ -z "$current" ]; then
     current=$(cat "$state_dir/state" 2>/dev/null || true)
 fi
 
-# Already in the requested state: nothing to do. This is the fix for the
-# inverted press/release behaviour.
 if [ "$current" = "$action" ]; then
-    exit 0
+    if [ "$action" = stop ]; then
+        note "noop action=stop current=stop"
+        exit 0
+    fi
+    # Already recording. A duplicate trigger from the same press must not
+    # restart it; a recording started elsewhere must not swallow the press.
+    since=$(cat "$state_dir/since" 2>/dev/null || echo 0)
+    case "$since" in '' | *[!0-9]*) since=0 ;; esac
+    now=$(date +%s)
+    if [ "$since" -gt 0 ] && [ $((now - since)) -le 2 ]; then
+        note "noop action=start current=start age=$((now - since))s"
+        exit 0
+    fi
+    note "restart action=start current=start age=$((now - since))s"
+    toggle stop || exit 1
+    sleep 0.05
 fi
 
-handy --toggle-transcription >/dev/null 2>&1 || {
-    echo "handy-remote-trigger: handy --toggle-transcription failed" >&2
-    exit 1
-}
-printf '%s' "$action" >"$state_dir/state"
+note "toggle($action) current=${current:-none}"
+toggle "$action" || exit 1
 
 # Handy writes its log asynchronously; confirm the toggle landed.
 for _ in $(seq 1 10); do
     sleep 0.02
     if [ "$(last_action)" = "$action" ]; then
+        note "confirmed $action"
         exit 0
     fi
 done
 
-echo "handy-remote-trigger: wanted $action, log last=$(last_action)" >&2
+note "unconfirmed $action log_last=$(last_action)"
 exit 0

@@ -1,0 +1,12 @@
+[Unit]
+Description=voice-remote: ATVV BLE voice remote microphone
+After=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ -d @MAC@ --trigger-cmd '@TRIGGER@'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -21,6 +21,28 @@ If you have a remote you'd like to test, open an issue with the device name, Blu
 
 ## Installation
 
+### Chromecast Voice Remote — one-shot setup (this fork)
+
+This fork adds the sink-backed microphone, a hold-to-talk trigger for
+[Handy](https://handy.computer) and the udev button remap, so a Chromecast Voice Remote works
+as a dictation mic without touching the keyboard.
+
+```bash
+git clone https://github.com/hs-ye/ATVVoice ~/GitRepos/ATVVoice
+cd ~/GitRepos/ATVVoice
+./install.sh --dry-run          # prints every action, changes nothing
+./install.sh --install-deps --set-default
+```
+
+It builds this checkout, installs `atvvoice` and `handy-remote-trigger` into `~/.local/bin`,
+writes and enables the systemd user unit, installs the udev button remap when the remote is
+connected, and merges `always_on_microphone` into Handy's settings.
+
+Prerequisites: the remote paired and trusted (`bluetoothctl pair/trust`), and Handy installed
+with a model downloaded. The daemon starts at boot and waits for the remote; after a reboot,
+wake it with any button — the virtual mic and the trigger only exist once it has connected.
+If a press does nothing, `tail ~/.local/state/handy-remote/trigger.log` names the failed hop.
+
 ### Nix flake
 
 ```nix

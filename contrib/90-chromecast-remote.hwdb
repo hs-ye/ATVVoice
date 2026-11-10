@@ -1,0 +1,17 @@
+# Chromecast Voice Remote (G9N9N) — Google 18d1:9450
+#
+# The remote reports its extra buttons as vendor HID usages that Linux maps
+# to unrelated keycodes above 247 (KEY_SELECT, KEY_TV, KEY_CAMERA_ACCESS_*).
+# X11 keycodes stop at 255, so those buttons look dead in every X app.
+# Remap them by scancode here, below X, so all consumers see a normal key.
+
+evdev:input:b0005v18D1p9450*
+ KEYBOARD_KEY_c0041=enter     # OK             (usage 0x041, KEY_SELECT 353)
+ KEYBOARD_KEY_c0224=esc       # Back           (usage 0x224, KEY_BACK 158)
+ KEYBOARD_KEY_c0223=leftmeta  # Home           (usage 0x223, KEY_HOMEPAGE 172)
+ KEYBOARD_KEY_c00e9=pageup    # Volume +       (usage 0x0e9, KEY_VOLUMEUP 115)
+ KEYBOARD_KEY_c00ea=pagedown  # Volume -       (usage 0x0ea, KEY_VOLUMEDOWN 114)
+ KEYBOARD_KEY_c0077=slash     # YouTube        (usage 0x077, code 588)
+ KEYBOARD_KEY_c0089=tab       # input switch   (usage 0x089, KEY_TV 377)
+ KEYBOARD_KEY_c00e2=home      # Mute           (usage 0x0e2, KEY_MUTE 113)
+ KEYBOARD_KEY_c0078=backspace # Netflix        (usage 0x078, code 589)
